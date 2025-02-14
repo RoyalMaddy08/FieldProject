@@ -1,109 +1,139 @@
-!pip install opencv-python numpy scipy
-
 import cv2
 import numpy as np
 from scipy.signal import find_peaks, butter, filtfilt
-import time
-from IPython.display import display, clear_output
 import matplotlib.pyplot as plt
 
-# Constants
-FACE_DETECTION_MODEL = "haarcascade_frontalface_default.xml"
-FOREHEAD_RATIO = 0.25  # Ratio of forehead height to face height
-FPS = 30  # Webcam frame rate
-BUFFER_SIZE = 150  # Number of frames to analyze for BPM calculation
-MIN_BPM = 40  # Minimum valid BPM
-MAX_BPM = 180  # Maximum valid BPM
+class PulseDetector:
+    def __init__(self, buffer_size=300, fps=30):
+        self.buffer_size = buffer_size
+        self.fps = fps
+        self.green_values = []
+        self.times = []
+        self.start_time = None
 
-# Bandpass filter for heart rate signal
-def bandpass_filter(signal, lowcut=0.8, highcut=3.0, fs=FPS, order=5):
-    nyquist = 0.5 * fs
-    low = lowcut / nyquist
-    high = highcut / nyquist
-    b, a = butter(order, [low, high], btype='band')
-    return filtfilt(b, a, signal)
+    def butter_bandpass(self, lowcut=0.7, highcut=4.0, order=5):
+        """Bandpass filter to isolate pulse frequency range."""
+        nyquist = 0.5 * self.fps
+        low = lowcut / nyquist
+        high = highcut / nyquist
+        b, a = butter(order, [low, high], btype='band')
+        return b, a
 
-# Initialize face detector
-face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + FACE_DETECTION_MODEL)
+    def process_frame(self, frame):
+        """Process each frame to extract the ROI and compute the green channel mean."""
+        # Convert to RGB
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-# Initialize webcam
-cap = cv2.VideoCapture(0)
-if not cap.isOpened():
-    raise Exception("Webcam not found!")
+        # Define forehead ROI (adjust these values based on your needs)
+        height, width = frame.shape[:2]
+        forehead_top = int(height * 0.1)
+        forehead_bottom = int(height * 0.3)
+        forehead_left = int(width * 0.3)
+        forehead_right = int(width * 0.7)
 
-# Buffer for storing green channel intensities
-green_buffer = []
-bpm = 0
-last_face_time = time.time()
+        # Extract forehead region
+        forehead_region = rgb_frame[forehead_top:forehead_bottom, forehead_left:forehead_right]
 
-# Create a matplotlib figure for displaying the video feed
-plt.ion()
-fig, ax = plt.subplots(figsize=(10, 6))
-ax.set_title("Pulse Detector")
-ax.axis('off')
-img_display = ax.imshow(np.zeros((480, 640, 3), dtype=np.uint8))
+        # Calculate mean green value
+        green_mean = np.mean(forehead_region[:, :, 1])
 
-try:
+        # Track time
+        if self.start_time is None:
+            self.start_time = cv2.getTickCount() / cv2.getTickFrequency()
+        current_time = (cv2.getTickCount() / cv2.getTickFrequency()) - self.start_time
+
+        # Update buffers
+        self.green_values.append(green_mean)
+        self.times.append(current_time)
+
+        # Keep only recent values
+        if len(self.green_values) > self.buffer_size:
+            self.green_values.pop(0)
+            self.times.pop(0)
+
+        # Draw ROI on frame
+        cv2.rectangle(frame, (forehead_left, forehead_top),
+                      (forehead_right, forehead_bottom), (0, 255, 0), 2)
+
+        return frame
+
+    def compute_pulse(self):
+        """Compute the pulse rate from the green channel signal."""
+        if len(self.green_values) < self.buffer_size:
+            return None, None
+
+        # Detrend and normalize the signal
+        signal = np.array(self.green_values)
+        signal = signal - np.mean(signal)
+        signal = signal / np.std(signal)
+
+        # Apply bandpass filter
+        b, a = self.butter_bandpass()
+        filtered_signal = filtfilt(b, a, signal)
+
+        # Find peaks
+        peaks, _ = find_peaks(filtered_signal, distance=self.fps // 2, height=0.5)
+
+        if len(peaks) < 2:
+            return None, None
+
+        # Calculate pulse rate
+        peak_times = np.array([self.times[p] for p in peaks])
+        intervals = np.diff(peak_times)
+        mean_interval = np.mean(intervals)
+        pulse_rate = 60.0 / mean_interval
+
+        return filtered_signal, int(round(pulse_rate))
+
+def main():
+    cap = cv2.VideoCapture(0)
+    detector = PulseDetector()
+    plt.ion()
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
+
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        # Convert frame to grayscale for face detection
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(100, 100))
+        # Process frame
+        processed_frame = detector.process_frame(frame)
 
-        if len(faces) > 0:
-            # Get the largest face
-            (x, y, w, h) = max(faces, key=lambda f: f[2] * f[3])
+        # Compute pulse rate
+        filtered_signal, pulse_rate = detector.compute_pulse()
 
-            # Extract forehead region
-            forehead_h = int(h * FOREHEAD_RATIO)
-            forehead = frame[y:y + forehead_h, x:x + w]
+        # Display pulse rate on frame
+        if pulse_rate is not None:
+            cv2.putText(processed_frame, f"Pulse: {pulse_rate} BPM",
+                       (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1,
+                       (0, 255, 0), 2)
 
-            # Extract green channel intensity
-            green_intensity = np.mean(forehead[:, :, 1])  # Green channel is index 1
-            green_buffer.append(green_intensity)
+        # Update plots
+        if filtered_signal is not None:
+            ax1.clear()
+            ax1.plot(detector.times, detector.green_values)
+            ax1.set_title('Raw Signal')
+            ax1.set_xlabel('Time (s)')
+            ax1.set_ylabel('Green Channel Value')
 
-            # Keep buffer size fixed
-            if len(green_buffer) > BUFFER_SIZE:
-                green_buffer.pop(0)
+            ax2.clear()
+            ax2.plot(detector.times, filtered_signal)
+            ax2.set_title('Filtered Signal')
+            ax2.set_xlabel('Time (s)')
+            ax2.set_ylabel('Normalized Value')
+            plt.tight_layout()
+            plt.draw()
+            plt.pause(0.001)
 
-            # Draw forehead region
-            cv2.rectangle(frame, (x, y), (x + w, y + forehead_h), (0, 255, 0), 2)
+        # Display frame
+        cv2.imshow('Pulse Detection', processed_frame)
 
-            # Calculate BPM if enough data is available
-            if len(green_buffer) == BUFFER_SIZE:
-                # Apply bandpass filter
-                filtered_signal = bandpass_filter(green_buffer)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
 
-                # Find peaks in the filtered signal
-                peaks, _ = find_peaks(filtered_signal, distance=FPS * 2)
-                if len(peaks) >= 2:
-                    peak_times = np.array(peaks) / FPS
-                    bpm = 60 / np.mean(np.diff(peak_times))
-                    bpm = np.clip(bpm, MIN_BPM, MAX_BPM)  # Clip to valid range
-
-            last_face_time = time.time()
-        else:
-            # Reset BPM if no face is detected
-            if time.time() - last_face_time > 1:  # 1-second delay before reset
-                bpm = 0
-                green_buffer = []
-
-        # Display BPM on the frame
-        cv2.putText(frame, f"BPM: {int(bpm)}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-
-        # Update the display in Jupyter Notebook
-        img_display.set_data(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        clear_output(wait=True)
-        display(fig)
-        plt.pause(0.01)  # Small delay to allow the display to update
-
-except KeyboardInterrupt:
-    print("Stopping the pulse detector...")
-
-finally:
-    # Release resources
     cap.release()
+    cv2.destroyAllWindows()
     plt.close()
+
+if __name__ == "__main__":
+    main()
